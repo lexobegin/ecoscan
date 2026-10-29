@@ -37,7 +37,7 @@
   .chip.rec { border-color:#1565c0; }
   .chip.total { border-color:#f2b705; }
   @keyframes pop { 0%{transform:scale(1)} 50%{transform:scale(1.07)} 100%{transform:scale(1)} }
-  .tarjeta.pop { animation:pop .35s; }
+  .tarjeta.pop, .chip.pop { animation:pop .4s; }
   #estado { color:#9fb3bd; font-size:14px; margin-top:12px; text-align:center; min-height:20px; }
 </style>
 </head>
@@ -52,7 +52,9 @@
     <button id="btnCamara" disabled>▶️ Encender cámara</button>
     <button id="btnGirar" class="sec" disabled>🔄 Cambiar cámara</button>
     <button id="btnParar" class="sec" disabled>⏹️ Apagar</button>
+    <button id="btnFoto" class="sec" disabled>📁 Probar con foto</button>
   </div>
+  <input type="file" id="foto" accept="image/*" style="display:none">
 
   <div id="resultado" class="tarjeta">
     <div id="emoji">🤔</div>
@@ -63,9 +65,9 @@
   </div>
 
   <div class="marcador">
-    <div class="chip org">🍌 <span id="cOrg">0</span></div>
-    <div class="chip rec">♻️ <span id="cRec">0</span></div>
-    <div class="chip total">🏆 <span id="cTotal">0</span></div>
+    <div class="chip org" id="chipOrg">🍌 <span id="cOrg">0</span></div>
+    <div class="chip rec" id="chipRec">♻️ <span id="cRec">0</span></div>
+    <div class="chip total" id="chipTotal">🏆 <span id="cTotal">0</span></div>
   </div>
   <div class="botones2"><button id="btnReset" class="sec">🧹 Reiniciar puntos</button></div>
 
@@ -74,16 +76,14 @@
 <script>
 let modelo = null, inputW = 64, inputH = 64;
 let stream = null, facing = "environment", corriendo = false;
-let historial = [], ultimaClase = null;
-const N_MEDIANA = 7;
+let historial = [], ultimaClase = null, ultimaVez = 0;
+const N_MEDIANA = 5;
 const $ = id => document.getElementById(id);
 
-// ---------- 1) Cargar modelo: detecta tamaño, repara nombres de pesos y carga ----------
+// ---------- 1) Cargar modelo (mismo proceso que ya te funcionó) ----------
 async function cargarModelo() {
   try {
     const info = await (await fetch("model.json")).json();
-
-    // a) tamaño de entrada desde el InputLayer
     try {
       const capas = info.modelTopology.model_config.config.layers;
       for (const c of capas) {
@@ -96,20 +96,14 @@ async function cargarModelo() {
       }
     } catch (e) { console.warn("Tamaño por defecto 64x64:", e); }
 
-    // b) reparar etiquetas: quitar el prefijo con el nombre del modelo (ej. "sequential_1/")
     let prefijo = "";
-    for (const bloque of info.weightsManifest) {
+    for (const bloque of info.weightsManifest)
       for (const w of bloque.weights) {
-        const pedazos = w.name.split("/");
-        if (pedazos.length > 2) {
-          prefijo = pedazos[0];
-          w.name = pedazos.slice(1).join("/");
-        }
+        const p = w.name.split("/");
+        if (p.length > 2) { prefijo = p[0]; w.name = p.slice(1).join("/"); }
       }
-    }
     if (prefijo) console.log("Pesos re-etiquetados (se quitó el prefijo '" + prefijo + "/')");
 
-    // c) descargar los shards y armar el bloque binario de pesos
     const binarios = [];
     for (const bloque of info.weightsManifest)
       for (const ruta of bloque.paths)
@@ -118,12 +112,10 @@ async function cargarModelo() {
     const weightData = new Uint8Array(total);
     let pos = 0;
     for (const b of binarios) { weightData.set(new Uint8Array(b), pos); pos += b.byteLength; }
-    const weightSpecs = info.weightsManifest.flatMap(b => b.weights);
 
-    // d) cargar el modelo ya corregido
     modelo = await tf.loadLayersModel(tf.io.fromMemory({
       modelTopology: info.modelTopology,
-      weightSpecs: weightSpecs,
+      weightSpecs: info.weightsManifest.flatMap(b => b.weights),
       weightData: weightData
     }));
   } catch (e) {
@@ -132,18 +124,41 @@ async function cargarModelo() {
     return;
   }
   $("estado").textContent = "✅ Modelo listo (" + inputW + "x" + inputH +
-                            ") — backend: " + tf.getBackend() + " — enciende la cámara";
-  actualizarBotones(false);
+                            ") — backend: " + tf.getBackend();
+  $("btnCamara").disabled = false;
+  $("btnFoto").disabled = false;
 }
 
-// ---------- 2) Estados de botones (claros y a prueba de clics raros) ----------
+// ---------- 2) Dibujo con recorte central (el objeto llena el encuadre) ----------
+function dibujarRecortado(fuente, anchoNat, altoNat, espejar) {
+  const lienzo = $("lienzo");
+  lienzo.width = inputW; lienzo.height = inputH;
+  const ctx = lienzo.getContext("2d", { willReadFrequently: true });
+  const lado = Math.min(anchoNat, altoNat);
+  const sx = (anchoNat - lado) / 2, sy = (altoNat - lado) / 2;
+  if (espejar) { ctx.save(); ctx.translate(inputW, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(fuente, sx, sy, lado, lado, 0, 0, inputW, inputH);
+  if (espejar) ctx.restore();
+  return lienzo;
+}
+
+async function predecirLienzo() {
+  const salida = tf.tidy(() => {
+    const img = tf.browser.fromPixels($("lienzo"), 3).toFloat().expandDims(0);
+    return modelo.predict(img);
+  });
+  const prob = (await salida.data())[0];
+  salida.dispose();
+  return prob;
+}
+
+// ---------- 3) Cámara ----------
 function actualizarBotones(camaraActiva) {
   $("btnCamara").disabled = camaraActiva || !modelo;
   $("btnParar").disabled  = !camaraActiva;
   $("btnGirar").disabled  = !camaraActiva;
 }
 
-// ---------- 3) Cámara ----------
 async function iniciarCamara() {
   detenerCamara();
   $("btnCamara").disabled = true;
@@ -153,22 +168,21 @@ async function iniciarCamara() {
       video: { facingMode: facing, width: {ideal:1280}, height: {ideal:720} },
       audio: false });
   } catch (e) {
-    $("estado").textContent = "❌ Sin acceso a la cámara (" + e.name + "). Dale permiso y prueba de nuevo.";
+    $("estado").textContent = "❌ Sin acceso a la cámara (" + e.name + ").";
     actualizarBotones(false);
     return;
   }
   const video = $("video");
   video.srcObject = stream;
   try {
-    if (video.readyState < 2) {
+    if (video.readyState < 2)
       await new Promise(r => video.addEventListener("loadeddata", r, {once: true}));
-    }
     await video.play();
-  } catch (e) { console.warn("El video aún estaba arrancando:", e.name); }
+  } catch (e) { console.warn("Video arrancando:", e.name); }
   video.style.transform = facing === "user" ? "scaleX(-1)" : "none";
   corriendo = true;
   actualizarBotones(true);
-  $("estado").textContent = "🎥 Cámara activa — apunta a un residuo";
+  $("estado").textContent = "🎥 Cámara activa — acércate al residuo";
   predecirEnBucle();
 }
 
@@ -176,6 +190,7 @@ function detenerCamara() {
   corriendo = false;
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   $("video").srcObject = null;
+  historial = [];
   actualizarBotones(false);
 }
 
@@ -184,35 +199,39 @@ function cambiarCamara() {
   if (corriendo) iniciarCamara();
 }
 
-// ---------- 4) Predicción en vivo (mediana de 7 para estabilizar) ----------
+// ---------- 4) Bucle en vivo: mediana de 5, ciclo rápido ----------
 async function predecirEnBucle() {
   if (!corriendo) return;
   const video = $("video");
   if (video.readyState >= 2 && modelo) {
-    const lienzo = $("lienzo");
-    lienzo.width = inputW; lienzo.height = inputH;
-    const ctx = lienzo.getContext("2d", { willReadFrequently: true });
-    if (facing === "user") { ctx.save(); ctx.translate(inputW,0); ctx.scale(-1,1); }
-    ctx.drawImage(video, 0, 0, inputW, inputH);
-    if (facing === "user") ctx.restore();
-
-    const salida = tf.tidy(() => {
-      const img = tf.browser.fromPixels(lienzo, 3).toFloat().expandDims(0);
-      return modelo.predict(img);
-    });
-    const prob = (await salida.data())[0];
-    salida.dispose();
-
+    dibujarRecortado(video, video.videoWidth, video.videoHeight, facing === "user");
+    const prob = await predecirLienzo();
     historial.push(prob);
     if (historial.length > N_MEDIANA) historial.shift();
-    if (historial.length === N_MEDIANA) {
-      actualizarUI([...historial].sort((a,b)=>a-b)[3]);
-    }
+    if (historial.length === N_MEDIANA)
+      actualizarUI([...historial].sort((a,b)=>a-b)[Math.floor(N_MEDIANA/2)]);
   }
-  setTimeout(predecirEnBucle, 250);
+  setTimeout(predecirEnBucle, 150);
 }
 
-// ---------- 5) Interfaz + puntos ----------
+// ---------- 5) Foto subida (diagnóstico directo contra Colab) ----------
+ $("btnFoto").onclick = () => $("foto").click();
+ $("foto").onchange = (e) => {
+  const archivo = e.target.files[0];
+  if (!archivo || !modelo) return;
+  const img = new Image();
+  img.onload = async () => {
+    dibujarRecortado(img, img.naturalWidth, img.naturalHeight, false);
+    const prob = await predecirLienzo();
+    actualizarUI(prob);
+    $("estado").textContent = "📁 Foto analizada — compárala con el resultado de Colab";
+    URL.revokeObjectURL(img.src);
+  };
+  img.src = URL.createObjectURL(archivo);
+  e.target.value = "";
+};
+
+// ---------- 6) Interfaz + puntos (con memoria corregida) ----------
 function actualizarUI(prob) {
   const esRec = prob >= 0.5;
   const clase = esRec ? "rec" : "org";
@@ -225,13 +244,15 @@ function actualizarUI(prob) {
   $("barra").style.width = pct + "%";
   $("confianza").textContent = "Seguridad: " + pct + "%";
 
-  if (clase !== ultimaClase) {
+  // +1 cada vez que la IA cambia de clasificación (objeto nuevo)
+  if (clase !== ultimaClase && Date.now() - ultimaVez > 1000) {
     ultimaClase = clase;
+    ultimaVez = Date.now();
     const key = clase === "rec" ? "eco_rec" : "eco_org";
     localStorage.setItem(key, (+localStorage.getItem(key) || 0) + 1);
     mostrarPuntos();
-    const t = $("resultado");
-    t.classList.remove("pop"); void t.offsetWidth; t.classList.add("pop");
+    const chip = clase === "rec" ? $("chipRec") : $("chipOrg");
+    chip.classList.remove("pop"); void chip.offsetWidth; chip.classList.add("pop");
   }
 }
 function mostrarPuntos() {
@@ -241,7 +262,9 @@ function mostrarPuntos() {
   $("cTotal").textContent = org + rec;
 }
 function reiniciarPuntos() {
-  localStorage.removeItem("eco_org"); localStorage.removeItem("eco_rec");
+  localStorage.removeItem("eco_org");
+  localStorage.removeItem("eco_rec");
+  ultimaClase = null; ultimaVez = 0; historial = [];
   mostrarPuntos();
 }
 
@@ -250,7 +273,6 @@ function reiniciarPuntos() {
  $("btnParar").onclick = () => { detenerCamara(); $("estado").textContent = "⏹️ Cámara apagada"; };
  $("btnReset").onclick = reiniciarPuntos;
 mostrarPuntos();
-actualizarBotones(false);
 cargarModelo();
 </script>
 </body>
