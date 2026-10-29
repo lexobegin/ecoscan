@@ -92,7 +92,7 @@ async function cargarModelo() {
     }
   } catch (e) { console.warn("Uso 64x64 por defecto:", e); }
 
-  modelo = await tf.loadLayersModel("model.json");
+  modelo = await tf.loadLayersModel("https://lexobegin.github.io/ecoscan/model.json");
   console.log(`Entrada del modelo: ${inputW}x${inputH}`);
   $("estado").textContent = `✅ Modelo listo (${inputW}x${inputH}) — enciende la cámara`;
   $("btnCamara").disabled = false;
