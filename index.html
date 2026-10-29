@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,">
 <title>EcoScan — ¿A qué basurero va? La IA decide 🍌♻️</title>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <style>
@@ -17,7 +18,7 @@
   .botones, .botones2 { display:flex; gap:10px; margin:14px 0; flex-wrap:wrap; justify-content:center; }
   button { background:#22d3a7; color:#06251d; border:none; padding:12px 18px;
            border-radius:12px; font-size:15px; font-weight:bold; cursor:pointer; }
-  button:disabled { opacity:.4; cursor:not-allowed; }
+  button:disabled { opacity:.35; cursor:not-allowed; }
   button.sec { background:#2b3945; color:#e7ecef; }
   .tarjeta { width:100%; max-width:420px; background:#161d23; border:2px solid #2b3945;
              border-radius:20px; padding:18px; text-align:center; margin-top:6px; }
@@ -37,7 +38,7 @@
   .chip.total { border-color:#f2b705; }
   @keyframes pop { 0%{transform:scale(1)} 50%{transform:scale(1.07)} 100%{transform:scale(1)} }
   .tarjeta.pop { animation:pop .35s; }
-  #estado { color:#9fb3bd; font-size:14px; margin-top:12px; text-align:center; }
+  #estado { color:#9fb3bd; font-size:14px; margin-top:12px; text-align:center; min-height:20px; }
 </style>
 </head>
 <body>
@@ -49,8 +50,8 @@
 
   <div class="botones">
     <button id="btnCamara" disabled>▶️ Encender cámara</button>
-    <button id="btnGirar" class="sec">🔄 Cambiar cámara</button>
-    <button id="btnParar" class="sec">⏹️ Apagar</button>
+    <button id="btnGirar" class="sec" disabled>🔄 Cambiar cámara</button>
+    <button id="btnParar" class="sec" disabled>⏹️ Apagar</button>
   </div>
 
   <div id="resultado" class="tarjeta">
@@ -74,60 +75,116 @@
 let modelo = null, inputW = 64, inputH = 64;
 let stream = null, facing = "environment", corriendo = false;
 let historial = [], ultimaClase = null;
-const N_MEDIANA = 7;                       // predicciones para estabilizar
+const N_MEDIANA = 7;
 const $ = id => document.getElementById(id);
 
-// ---------- 1) Cargar modelo y detectar tamaño de entrada ----------
+// ---------- 1) Cargar modelo: detecta tamaño, repara nombres de pesos y carga ----------
 async function cargarModelo() {
   try {
     const info = await (await fetch("model.json")).json();
-    const capas = info.modelTopology.model_config.config.layers;
-    for (const c of capas) {
-      const cfg = c.config || {};
-      if ((c.class_name || "") === "InputLayer" && Array.isArray(cfg.batch_input_shape)
-          && cfg.batch_input_shape.length === 4) {
-        inputH = cfg.batch_input_shape[1];
-        inputW = cfg.batch_input_shape[2];
+
+    // a) tamaño de entrada desde el InputLayer
+    try {
+      const capas = info.modelTopology.model_config.config.layers;
+      for (const c of capas) {
+        const cfg = c.config || {};
+        if ((c.class_name || "") === "InputLayer" &&
+            Array.isArray(cfg.batch_input_shape) && cfg.batch_input_shape.length === 4) {
+          inputH = cfg.batch_input_shape[1];
+          inputW = cfg.batch_input_shape[2];
+        }
+      }
+    } catch (e) { console.warn("Tamaño por defecto 64x64:", e); }
+
+    // b) reparar etiquetas: quitar el prefijo con el nombre del modelo (ej. "sequential_1/")
+    let prefijo = "";
+    for (const bloque of info.weightsManifest) {
+      for (const w of bloque.weights) {
+        const pedazos = w.name.split("/");
+        if (pedazos.length > 2) {
+          prefijo = pedazos[0];
+          w.name = pedazos.slice(1).join("/");
+        }
       }
     }
-  } catch (e) { console.warn("Uso 64x64 por defecto:", e); }
+    if (prefijo) console.log("Pesos re-etiquetados (se quitó el prefijo '" + prefijo + "/')");
 
-  modelo = await tf.loadLayersModel("https://lexobegin.github.io/ecoscan/model.json");
-  console.log(`Entrada del modelo: ${inputW}x${inputH}`);
-  $("estado").textContent = `✅ Modelo listo (${inputW}x${inputH}) — enciende la cámara`;
-  $("btnCamara").disabled = false;
+    // c) descargar los shards y armar el bloque binario de pesos
+    const binarios = [];
+    for (const bloque of info.weightsManifest)
+      for (const ruta of bloque.paths)
+        binarios.push(await (await fetch(ruta)).arrayBuffer());
+    const total = binarios.reduce((s, b) => s + b.byteLength, 0);
+    const weightData = new Uint8Array(total);
+    let pos = 0;
+    for (const b of binarios) { weightData.set(new Uint8Array(b), pos); pos += b.byteLength; }
+    const weightSpecs = info.weightsManifest.flatMap(b => b.weights);
+
+    // d) cargar el modelo ya corregido
+    modelo = await tf.loadLayersModel(tf.io.fromMemory({
+      modelTopology: info.modelTopology,
+      weightSpecs: weightSpecs,
+      weightData: weightData
+    }));
+  } catch (e) {
+    console.error("Error cargando el modelo:", e);
+    $("estado").textContent = "❌ Error cargando el modelo: " + e.message;
+    return;
+  }
+  $("estado").textContent = "✅ Modelo listo (" + inputW + "x" + inputH +
+                            ") — backend: " + tf.getBackend() + " — enciende la cámara";
+  actualizarBotones(false);
 }
 
-// ---------- 2) Cámara ----------
+// ---------- 2) Estados de botones (claros y a prueba de clics raros) ----------
+function actualizarBotones(camaraActiva) {
+  $("btnCamara").disabled = camaraActiva || !modelo;
+  $("btnParar").disabled  = !camaraActiva;
+  $("btnGirar").disabled  = !camaraActiva;
+}
+
+// ---------- 3) Cámara ----------
 async function iniciarCamara() {
   detenerCamara();
+  $("btnCamara").disabled = true;
+  $("estado").textContent = "📷 Pidiendo permiso de cámara…";
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: facing, width: {ideal:1280}, height: {ideal:720} },
       audio: false });
   } catch (e) {
-    $("estado").textContent = "❌ Sin acceso a la cámara. Dale permiso (la página debe ser HTTPS).";
+    $("estado").textContent = "❌ Sin acceso a la cámara (" + e.name + "). Dale permiso y prueba de nuevo.";
+    actualizarBotones(false);
     return;
   }
   const video = $("video");
   video.srcObject = stream;
-  await video.play();
+  try {
+    if (video.readyState < 2) {
+      await new Promise(r => video.addEventListener("loadeddata", r, {once: true}));
+    }
+    await video.play();
+  } catch (e) { console.warn("El video aún estaba arrancando:", e.name); }
   video.style.transform = facing === "user" ? "scaleX(-1)" : "none";
   corriendo = true;
-  $("btnCamara").disabled = true;
+  actualizarBotones(true);
+  $("estado").textContent = "🎥 Cámara activa — apunta a un residuo";
   predecirEnBucle();
 }
+
 function detenerCamara() {
   corriendo = false;
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-  $("btnCamara").disabled = false;
+  $("video").srcObject = null;
+  actualizarBotones(false);
 }
+
 function cambiarCamara() {
   facing = facing === "environment" ? "user" : "environment";
   if (corriendo) iniciarCamara();
 }
 
-// ---------- 3) Predicción en vivo (mediana de 7 para estabilizar) ----------
+// ---------- 4) Predicción en vivo (mediana de 7 para estabilizar) ----------
 async function predecirEnBucle() {
   if (!corriendo) return;
   const video = $("video");
@@ -140,24 +197,22 @@ async function predecirEnBucle() {
     if (facing === "user") ctx.restore();
 
     const salida = tf.tidy(() => {
-      // Píxeles 0-255 directo: el Rescaling dentro del modelo hace la división
       const img = tf.browser.fromPixels(lienzo, 3).toFloat().expandDims(0);
       return modelo.predict(img);
     });
-    const prob = (await salida.data())[0];   // probabilidad de RECICLABLE
+    const prob = (await salida.data())[0];
     salida.dispose();
 
     historial.push(prob);
     if (historial.length > N_MEDIANA) historial.shift();
     if (historial.length === N_MEDIANA) {
-      const mediana = [...historial].sort((a,b)=>a-b)[3];
-      actualizarUI(mediana);
+      actualizarUI([...historial].sort((a,b)=>a-b)[3]);
     }
   }
   setTimeout(predecirEnBucle, 250);
 }
 
-// ---------- 4) Interfaz + puntos ----------
+// ---------- 5) Interfaz + puntos ----------
 function actualizarUI(prob) {
   const esRec = prob >= 0.5;
   const clase = esRec ? "rec" : "org";
@@ -170,7 +225,7 @@ function actualizarUI(prob) {
   $("barra").style.width = pct + "%";
   $("confianza").textContent = "Seguridad: " + pct + "%";
 
-  if (clase !== ultimaClase) {           // solo suma cuando cambia de clase
+  if (clase !== ultimaClase) {
     ultimaClase = clase;
     const key = clase === "rec" ? "eco_rec" : "eco_org";
     localStorage.setItem(key, (+localStorage.getItem(key) || 0) + 1);
@@ -195,6 +250,7 @@ function reiniciarPuntos() {
  $("btnParar").onclick = () => { detenerCamara(); $("estado").textContent = "⏹️ Cámara apagada"; };
  $("btnReset").onclick = reiniciarPuntos;
 mostrarPuntos();
+actualizarBotones(false);
 cargarModelo();
 </script>
 </body>
